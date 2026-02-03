@@ -15,8 +15,8 @@ import re
 from datetime import datetime
 import sys
 
-# Load environment variables from .env file
-load_dotenv()
+# Load environment variables from .env file (do not override real env vars)
+load_dotenv(override=False)
 
 # Configure logging
 logging.basicConfig(
@@ -100,6 +100,9 @@ PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
 BIG_MODEL = os.environ.get("BIG_MODEL", "gpt-4.1")
 SMALL_MODEL = os.environ.get("SMALL_MODEL", "gpt-4.1-mini")
 
+# Optional: force all backend requests to use a specific model
+FORCE_MODEL = os.environ.get("FORCE_MODEL")
+
 # List of OpenAI models
 OPENAI_MODELS = [
     "o3-mini",
@@ -121,6 +124,41 @@ GEMINI_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.5-pro"
 ]
+
+# Normalize a model name to include provider prefix when possible
+def normalize_model_name(model_name: str) -> str:
+    if not model_name:
+        return model_name
+
+    # If already prefixed, keep as-is
+    if model_name.startswith(("openai/", "gemini/", "anthropic/")):
+        return model_name
+
+    # Add prefix based on known model lists
+    if model_name in GEMINI_MODELS:
+        return f"gemini/{model_name}"
+    if model_name in OPENAI_MODELS:
+        return f"openai/{model_name}"
+
+    # Heuristic for Anthropic models
+    if model_name.startswith("claude-"):
+        return f"anthropic/{model_name}"
+
+    # Fallback to preferred provider
+    if PREFERRED_PROVIDER == "google":
+        return f"gemini/{model_name}"
+    if PREFERRED_PROVIDER == "anthropic":
+        return f"anthropic/{model_name}"
+    return f"openai/{model_name}"
+
+def resolve_backend_model(request_model: str) -> str:
+    if FORCE_MODEL:
+        return normalize_model_name(FORCE_MODEL)
+    return request_model
+
+# Log force model config at startup
+if FORCE_MODEL:
+    logger.warning(f"FORCE_MODEL is set. All backend requests will use: {normalize_model_name(FORCE_MODEL)}")
 
 # Helper function to clean schema for Gemini
 def clean_gemini_schema(schema: Any) -> Any:
@@ -414,7 +452,10 @@ def parse_tool_result_content(content):
     except:
         return "Unparseable content"
 
-def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str, Any]:
+def convert_anthropic_to_litellm(
+    anthropic_request: MessagesRequest,
+    override_model: Optional[str] = None
+) -> Dict[str, Any]:
     """Convert Anthropic API request format to LiteLLM format (which follows OpenAI)."""
     # LiteLLM already handles Anthropic models when using the format model="anthropic/claude-3-opus-20240229"
     # So we just need to convert our Pydantic model to a dict in the expected format
@@ -546,15 +587,18 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                 
                 messages.append({"role": msg.role, "content": processed_content})
     
+    # Use override model if provided (e.g., FORCE_MODEL)
+    effective_model = override_model or anthropic_request.model
+
     # Cap max_tokens for OpenAI models to their limit of 16384
     max_tokens = anthropic_request.max_tokens
-    if anthropic_request.model.startswith("openai/") or anthropic_request.model.startswith("gemini/"):
+    if effective_model.startswith("openai/") or effective_model.startswith("gemini/"):
         max_tokens = min(max_tokens, 16384)
         logger.debug(f"Capping max_tokens to 16384 for OpenAI/Gemini model (original value: {anthropic_request.max_tokens})")
     
     # Create LiteLLM request dict
     litellm_request = {
-        "model": anthropic_request.model,  # it understands "anthropic/claude-x" format
+        "model": effective_model,  # it understands "anthropic/claude-x" format
         "messages": messages,
         "max_completion_tokens": max_tokens,
         "temperature": anthropic_request.temperature,
@@ -562,7 +606,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     }
 
     # Only include thinking field for Anthropic models
-    if anthropic_request.thinking and anthropic_request.model.startswith("anthropic/"):
+    if anthropic_request.thinking and effective_model.startswith("anthropic/"):
         litellm_request["thinking"] = anthropic_request.thinking
 
     # Add optional parameters if present
@@ -578,7 +622,7 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
     # Convert tools to OpenAI format
     if anthropic_request.tools:
         openai_tools = []
-        is_gemini_model = anthropic_request.model.startswith("gemini/")
+        is_gemini_model = effective_model.startswith("gemini/")
 
         for tool in anthropic_request.tools:
             # Convert to dict if it's a pydantic model
@@ -1119,30 +1163,33 @@ async def create_message(
         
         logger.debug(f"📊 PROCESSING REQUEST: Model={request.model}, Stream={request.stream}")
         
+        # Resolve the backend model (force if configured)
+        backend_model = resolve_backend_model(request.model)
+
         # Convert Anthropic request to LiteLLM format
-        litellm_request = convert_anthropic_to_litellm(request)
+        litellm_request = convert_anthropic_to_litellm(request, override_model=backend_model)
         
         # Determine which API key to use based on the model
-        if request.model.startswith("openai/"):
+        if backend_model.startswith("openai/"):
             litellm_request["api_key"] = OPENAI_API_KEY
             # Use custom OpenAI base URL if configured
             if OPENAI_BASE_URL:
                 litellm_request["api_base"] = OPENAI_BASE_URL
-                logger.debug(f"Using OpenAI API key and custom base URL {OPENAI_BASE_URL} for model: {request.model}")
+                logger.debug(f"Using OpenAI API key and custom base URL {OPENAI_BASE_URL} for model: {backend_model}")
             else:
-                logger.debug(f"Using OpenAI API key for model: {request.model}")
-        elif request.model.startswith("gemini/"):
+                logger.debug(f"Using OpenAI API key for model: {backend_model}")
+        elif backend_model.startswith("gemini/"):
             if USE_VERTEX_AUTH:
                 litellm_request["vertex_project"] = VERTEX_PROJECT
                 litellm_request["vertex_location"] = VERTEX_LOCATION
                 litellm_request["custom_llm_provider"] = "vertex_ai"
-                logger.debug(f"Using Gemini ADC with project={VERTEX_PROJECT}, location={VERTEX_LOCATION} and model: {request.model}")
+                logger.debug(f"Using Gemini ADC with project={VERTEX_PROJECT}, location={VERTEX_LOCATION} and model: {backend_model}")
             else:
                 litellm_request["api_key"] = GEMINI_API_KEY
-                logger.debug(f"Using Gemini API key for model: {request.model}")
+                logger.debug(f"Using Gemini API key for model: {backend_model}")
         else:
             litellm_request["api_key"] = ANTHROPIC_API_KEY
-            logger.debug(f"Using Anthropic API key for model: {request.model}")
+            logger.debug(f"Using Anthropic API key for model: {backend_model}")
         
         # For OpenAI models - modify request format to work with limitations
         if "openai" in litellm_request["model"] and "messages" in litellm_request:
@@ -1404,6 +1451,9 @@ async def count_tokens(
         elif clean_model.startswith("openai/"):
             clean_model = clean_model[len("openai/"):]
         
+        # Resolve backend model (force if configured)
+        backend_model = resolve_backend_model(request.model)
+
         # Convert the messages to a format LiteLLM can understand
         converted_request = convert_anthropic_to_litellm(
             MessagesRequest(
@@ -1414,7 +1464,8 @@ async def count_tokens(
                 tools=request.tools,
                 tool_choice=request.tool_choice,
                 thinking=request.thinking
-            )
+            ),
+            override_model=backend_model
         )
         
         # Use LiteLLM's token_counter function
@@ -1442,7 +1493,7 @@ async def count_tokens(
             }
             
             # Add custom base URL for OpenAI models if configured
-            if request.model.startswith("openai/") and OPENAI_BASE_URL:
+            if backend_model.startswith("openai/") and OPENAI_BASE_URL:
                 token_counter_args["api_base"] = OPENAI_BASE_URL
             
             # Count tokens

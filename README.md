@@ -37,7 +37,8 @@ A proxy server that lets you use Anthropic clients with Gemini, OpenAI, or Anthr
    ```bash
    cp .env.example .env
    ```
-   Edit `.env` and fill in your API keys and model configurations:
+   Edit `.env` and fill in your API keys and model configurations.
+   Environment variables always take precedence over `.env` values.
 
    *   `ANTHROPIC_API_KEY`: (Optional) Needed only if proxying *to* Anthropic models.
    *   `OPENAI_API_KEY`: Your OpenAI API key (Required if using the default OpenAI preference or as fallback).
@@ -48,11 +49,13 @@ A proxy server that lets you use Anthropic clients with Gemini, OpenAI, or Anthr
    *   `PREFERRED_PROVIDER` (Optional): Set to `openai` (default), `google`, or `anthropic`. This determines the primary backend for mapping `haiku`/`sonnet`.
    *   `BIG_MODEL` (Optional): The model to map `sonnet` requests to. Defaults to `gpt-4.1` (if `PREFERRED_PROVIDER=openai`) or `gemini-2.5-pro-preview-03-25`. Ignored when `PREFERRED_PROVIDER=anthropic`.
    *   `SMALL_MODEL` (Optional): The model to map `haiku` requests to. Defaults to `gpt-4.1-mini` (if `PREFERRED_PROVIDER=openai`) or `gemini-2.0-flash`. Ignored when `PREFERRED_PROVIDER=anthropic`.
+   *   `FORCE_MODEL` (Optional): Force all backend requests to use this model, regardless of what the client sends. Accepts provider-prefixed models (e.g. `openai/gpt-4.1`, `gemini/gemini-2.5-pro`, `anthropic/claude-3-7-sonnet-20250219`) or bare model names (the proxy will add a prefix based on known lists or `PREFERRED_PROVIDER`).
 
    **Mapping Logic:**
    - If `PREFERRED_PROVIDER=openai` (default), `haiku`/`sonnet` map to `SMALL_MODEL`/`BIG_MODEL` prefixed with `openai/`.
    - If `PREFERRED_PROVIDER=google`, `haiku`/`sonnet` map to `SMALL_MODEL`/`BIG_MODEL` prefixed with `gemini/` *if* those models are in the server's known `GEMINI_MODELS` list (otherwise falls back to OpenAI mapping).
    - If `PREFERRED_PROVIDER=anthropic`, `haiku`/`sonnet` requests are passed directly to Anthropic with the `anthropic/` prefix without remapping to different models.
+   - If `FORCE_MODEL` is set, all backend requests use that model and the normal mapping rules are bypassed for execution.
 
 4. **Run the server**:
    ```bash
